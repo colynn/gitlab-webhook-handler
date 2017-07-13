@@ -1,21 +1,19 @@
 #!/usr/bin/env python
+# -*- coding: UTF-8 -*-
 import io
-import os
-import re
-import sys
 import json
-import subprocess
-import requests
 import ipaddress
 from flask import Flask, request, abort
 import argparse
 from gitlab_api import GitlabApi
+from Mailer import send_mail
 
 app = Flask(__name__)
 
 REPOS_JSON_PATH = None
 WHITELIST_IP = None
 repos = None
+
 
 @app.route("/", methods=['GET', 'POST'])
 def index():
@@ -29,81 +27,151 @@ def index():
         if not WHITELIST_IP is None:
             for block in [WHITELIST_IP]:
                 if ipaddress.ip_address(request_ip) in ipaddress.ip_network(block):
-                    break  # the remote_addr is within the network range of github.
+                    break  # the remote_addr is within the network range of GitLab.
             else:
                 abort(403)
 
         payload = json.loads(request.data)
 
-        # common for events
-        if payload['object_kind'] in ['push', 'issue']:
+        if payload['object_kind'] in ['tag_push', 'merge_request']:
             repo_meta = {
-                'homepage': payload['repository']['homepage'],
+                'homepage': payload['project']['homepage'],
             }
 
+            # load configure base on homepage.
             repo = repos.get(repo_meta['homepage'], None)
             private_token = repo.get('private_token', None)
 
-        if not repo:
-            return json.dumps({'error': "nothing to do for " + str(repo_meta)})
-
-        if payload['object_kind'] == "push":
-            match = re.match(r"refs/heads/(?P<branch>.*)", payload['ref'])
-            if match:
-                repo_meta['branch'] = match.groupdict()['branch']
+        if payload['object_kind'] == "tag_push":
+            if payload['message'] is None:
+                # delete tag
+                return "Delete Tag"
             else:
-                return json.dumps({'error': "unable to determine pushed branch"})
+                # create new tag
+                tag_ref = payload['ref'].split('/')[-1]
+                tag_project_id = payload['project_id']
+                # test_branch get from repos.json configure file.
+                test_branch = repo['tag_push'].get('test_branch', None)
 
-            push = repo.get("push", None)
-            if push:
-                branch = push.get(repo_meta['branch'], None)
-                if not branch:
-                    branch = repo['push'].get("other", None)
-                if branch:
-                    branch_actions = branch.get("actions", None)
+                gl = GitlabApi(repo_meta['homepage'], private_token)
+                response = gl.get("projects/" + str(tag_project_id) + "/repository/branches")
+                for branch_info in response:
+                    if test_branch == branch_info['name']:
+                        content = test_branch + " already exists !<br>"
 
-                    if branch_actions:
-                        for action in branch_actions:
-                            try:
-                                subp = subprocess.Popen(action, cwd=branch.get("path", "."), shell=True)
-                                subp.wait()
-                            except Exception as e:
-                                print e
-            return 'OK'
+                        delete_info = gl.delete("projects/" + str(tag_project_id) + "/repository/branches/" + test_branch)
+                        if delete_info:
+                            content += "Delete test branch: " + test_branch + "<br>"
+                        break
+                else:
+                    content = ""
 
-        if payload['object_kind'] == "issue":
-            issue = repo.get("issue", None)
-            if issue:
-                # notification for new issue
-                if issue.get("user_notify", None) and payload['object_attributes']['action'] == "open":
-                    if not private_token:
-                        abort(403)
-                    gl = GitlabApi(repo_meta['homepage'], private_token)
-                    notify = issue['user_notify']
-                    description = payload['object_attributes']['description']
-                    usernames = []
-                    for n in notify:
-                        username_match = re.match("^@[a-zA-Z0-9_.+-]+$", n)
-                        if username_match:
-                            # simple username
-                            usernames.append(n)
-                        else:
-                            # try to pull the email from the issue body
-                            # and derive the username from that
-                            body_match = re.match(n, description)
-                            if body_match and private_token:
-                                email = body_match.group(1)
-                                username = gl.lookup_username(email)
-                                if username:
-                                    usernames.append("@" + username)
-                    # narrow down to unique names
-                    usernames = list(set(usernames))
-                    if len(usernames) > 0:
-                        project_id = payload['object_attributes']['project_id']
-                        issue_id = payload['object_attributes']['id']
-                        gl.comment_on_issue(project_id, issue_id, "Automatic mention for %s" % (" and ".join(usernames)))
+                # base on tag_ref, create v1.0-test branch.
+                data = {'branch': test_branch, 'ref': tag_ref}
+                ok = gl.post("projects/" + str(tag_project_id) + "/repository/branches", data)
+                if ok:
+                    content += "Create new test branch (" + test_branch + ") success.<br>"
 
-            return 'OK'
+                to_list = repo.get("mail_to", None)
+                subject = "GitLab Notifications"
+                # Notice: Modified ME
+                # email content change to chinese
+                # UnicodeDecodeError: 'ascii' codec can't decode byte 0xe5 in position 0: ordinal not in range(128)
+
+                # content = "基于 tag: ".encode('utf-8') + tag_ref + " 产生最新的 测试(".encode('utf-8') + test_branch +
+                # ")分支, 可进行测试的构建部署.".encode('utf-8')
+                content += "Base on tag: " + tag_ref + ", Create the latest test (" + test_branch + \
+                           ") branch, then you can do test build/deploy."
+                status = send_mail(to_list, subject, content)
+                if status:
+                    return json.dumps(response)
+
+        if payload['object_kind'] == "merge_request":
+
+            # merge object attributes
+            merge_attri = payload['object_attributes']
+            target_pro_id = merge_attri['target_project_id']
+            project_branch = merge_attri['target_branch']
+
+            # Modified ME
+            # Notice other feature, develop branch have new changes.
+
+            if merge_attri['state'] == "merged":
+                gl = GitlabApi(repo_meta['homepage'], private_token)
+                data = {'tag_name': tag_name, 'ref': project_branch}
+                response = gl.post("projects/" + str(target_pro_id) + "/repository/tags", data)
+
+                return json.dumps(response)
+
+        # common for events
+        # if payload['object_kind'] in ['push', 'issue']:
+        #    repo_meta = {
+        #        'homepage': payload['repository']['homepage'],
+        #    }
+        #
+        #    repo = repos.get(repo_meta['homepage'], None)
+        #    private_token = repo.get('private_token', None)
+        #
+        # if not repo:
+        #    return json.dumps({'error': "nothing to do for " + str(repo_meta)})
+        #
+        # if payload['object_kind'] == "push":
+        #    match = re.match(r"refs/heads/(?P<branch>.*)", payload['ref'])
+        #    if match:
+        #        repo_meta['branch'] = match.groupdict()['branch']
+        #    else:
+        #        return json.dumps({'error': "unable to determine pushed branch"})
+        #
+        #    push = repo.get("push", None)
+        #    if push:
+        #        branch = push.get(repo_meta['branch'], None)
+        #        if not branch:
+        #            branch = repo['push'].get("other", None)
+        #        if branch:
+        #            branch_actions = branch.get("actions", None)
+        #
+        #            if branch_actions:
+        #                for action in branch_actions:
+        #                    try:
+        #                        subp = subprocess.Popen(action, cwd=branch.get("path", "."), shell=True)
+        #                        subp.wait()
+        #                    except Exception as e:
+        #                        print e
+        #    return 'OK'
+
+        # if payload['object_kind'] == "issue":
+        #    issue = repo.get("issue", None)
+        #    if issue:
+        #        # notification for new issue
+        #        if issue.get("user_notify", None) and payload['object_attributes']['action'] == "open":
+        #            if not private_token:
+        #                abort(403)
+        #            gl = GitlabApi(repo_meta['homepage'], private_token)
+        #            notify = issue['user_notify']
+        #            description = payload['object_attributes']['description']
+        #            usernames = []
+        #            for n in notify:
+        #                username_match = re.match("^@[a-zA-Z0-9_.+-]+$", n)
+        #                if username_match:
+        #                    # simple username
+        #                    usernames.append(n)
+        #                else:
+        #                    # try to pull the email from the issue body
+        #                    # and derive the username from that
+        #                    body_match = re.match(n, description)
+        #                    if body_match and private_token:
+        #                        email = body_match.group(1)
+        #                        username = gl.lookup_username(email)
+        #                        if username:
+        #                            usernames.append("@" + username)
+        #            # narrow down to unique names
+        #            usernames = list(set(usernames))
+        #            if len(usernames) > 0:
+        #                project_id = payload['object_attributes']['project_id']
+        #                issue_id = payload['object_attributes']['id']
+        #                gl.comment_on_issue(project_id, issue_id, "Automatic mention for %s" % (" and ".join(usernames)))
+        #
+        #    return 'OK'
 
         # unknown event type
         return json.dumps({'error': "wrong event type"})
