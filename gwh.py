@@ -7,12 +7,40 @@ from flask import Flask, request, abort
 import argparse
 from gitlab_api import GitlabApi
 from Mailer import send_mail
+import random, string
+
+import re
+from jenkinsapi.jenkins import Jenkins
+from jenkinsapi.utils.crumb_requester import CrumbRequester
+
 
 app = Flask(__name__)
 
 REPOS_JSON_PATH = None
 WHITELIST_IP = None
 repos = None
+
+
+def random_word(length):
+    return ''.join(random.choice(string.lowercase) for s in range(length))
+
+
+def update_jenkins_tag(base_url, application_name, tag_name):
+    crumb_requester = CrumbRequester(baseurl=base_url, username='admin', password='admin')
+    J = Jenkins(base_url, username='admin', password='admin', requester=crumb_requester)
+
+    key1 = J[application_name]
+    c = key1.get_config()
+    c = str(c)
+
+    c = re.sub('<name>tag_\d+\.\d</name>', '<name>' + tag_name + '</name>', c)
+    response_info = key1.update_config(c, full_response=True)
+    if response_info.status_code == 200:
+        return True
+    else:
+        print "Update the specific application tag Failed."
+        print response_info.text
+        return False
 
 
 @app.route("/", methods=['GET', 'POST'])
@@ -42,46 +70,45 @@ def index():
             repo = repos.get(repo_meta['homepage'], None)
             private_token = repo.get('private_token', None)
 
+            branch_dict = repo['branch_info']
+        # print json.dumps(payload)
         if payload['object_kind'] == "tag_push":
             if payload['message'] is None:
                 # delete tag
                 return "Delete Tag"
             else:
+                # Email subject
+                subject = "GitLab Notifications"
+                to_list = ["liuyuan001@zhongan.com"]
+
                 # create new tag
                 tag_ref = payload['ref'].split('/')[-1]
                 tag_project_id = payload['project_id']
-                # test_branch get from repos.json configure file.
-                test_branch = repo['tag_push'].get('test_branch', None)
+
+                match_str = re.match(r'[V|v]\d+', tag_ref)
+                if not match_str:
+                    return "No need update jenkins tag."
 
                 gl = GitlabApi(repo_meta['homepage'], private_token)
-                response = gl.get("projects/" + str(tag_project_id) + "/repository/branches")
-                for branch_info in response:
-                    if test_branch == branch_info['name']:
-                        content = test_branch + " already exists !<br>"
+                response = gl.get("projects/" + str(tag_project_id) + "?statistics=false")
+                project_name = response['path_with_namespace'].split("/")[-1]
 
-                        delete_info = gl.delete("projects/" + str(tag_project_id) + "/repository/branches/" + test_branch)
-                        if delete_info:
-                            content += "Delete test branch: " + test_branch + "<br>"
-                        break
+                jenkins_key = project_name + "-tst"
+
+                base_url = repos.get('jenkins_base_url', None)
+
+                update_sta = update_jenkins_tag(base_url, jenkins_key, tag_ref)
+                if update_sta:
+                    content = "update jenkins tag Success."
                 else:
-                    content = ""
+                    content = "update jenkins tag Failed."
 
-                # base on tag_ref, create v1.0-test branch.
-                data = {'branch': test_branch, 'ref': tag_ref}
-                ok = gl.post("projects/" + str(tag_project_id) + "/repository/branches", data)
-                if ok:
-                    content += "Create new test branch (" + test_branch + ") success.<br>"
-
-                to_list = repo.get("mail_to", None)
-                subject = "GitLab Notifications"
                 # Notice: Modified ME
                 # email content change to chinese
                 # UnicodeDecodeError: 'ascii' codec can't decode byte 0xe5 in position 0: ordinal not in range(128)
 
                 # content = "基于 tag: ".encode('utf-8') + tag_ref + " 产生最新的 测试(".encode('utf-8') + test_branch +
                 # ")分支, 可进行测试的构建部署.".encode('utf-8')
-                content += "Base on tag: " + tag_ref + ", Create the latest test (" + test_branch + \
-                           ") branch, then you can do test build/deploy."
                 status = send_mail(to_list, subject, content)
                 if status:
                     return json.dumps(response)
@@ -93,15 +120,62 @@ def index():
             target_pro_id = merge_attri['target_project_id']
             project_branch = merge_attri['target_branch']
 
-            # Modified ME
-            # Notice other feature, develop branch have new changes.
+            source_branch = [merge_attri['source_branch']]
+            all_branch = repo['branch_info'].keys()
+
+            if (source_branch[0] == "develop") or (project_branch != "develop"):
+                return "this is not feature branch's merge request."
+
+            if project_branch == "develop":
+                need_merge = list(set(source_branch) ^ set(all_branch))
+
+            gl = GitlabApi(repo_meta['homepage'], private_token)
+            r_changes =gl.get("projects/" + str(target_pro_id) + "/merge_requests/" + str(merge_attri['iid']) + "/changes")
+            if len(r_changes['changes']) == 0:
+                # print "do not trigger"
+                return "This merge didn't have changes, so do not trigger other feature branches merge."
 
             if merge_attri['state'] == "merged":
-                gl = GitlabApi(repo_meta['homepage'], private_token)
-                data = {'tag_name': tag_name, 'ref': project_branch}
-                response = gl.post("projects/" + str(target_pro_id) + "/repository/tags", data)
+                for i in need_merge:
+                    random_str = random_word(6)
+
+                    # Modified ME
+                    # git rebase
+                    data = {'source_branch': 'develop', 'target_branch': i,
+                            'title': 'system merge request_' + random_str + '_' + i}
+                    response = gl.post("projects/" + str(target_pro_id) + "/merge_requests", data)
+                    # print response
+                    merge_id = str(response['iid'])
+
+                    # check merge request info
+                    # merge_info = gl.get("projects/" + str(target_pro_id) + "/merge_requests/" + merge_id)
+                    # print merge_info
+
+                    access_mer = gl.put("projects/" + str(target_pro_id) + "/merge_requests/" + merge_id + "/merge")
+                    to_list = branch_dict[i]['mail_to']
+                    content = ""
+                    mer_subject = "GitLab Notifications "
+                    if access_mer == 405:
+                        content += "Branch cannot be merged"
+                        mer_subject += "Merge Conflicts"
+                    elif access_mer == 406:
+                        content += "You didn't have permission to execute merge."
+                        mer_subject += "Already merged"
+                    elif access_mer == 401:
+                        content += "You didn't have permission to execute merge."
+                        mer_subject += "Permission Deny"
+                    elif access_mer == 409:
+                        content += "the sha parameter is passed and does not match the HEAD of the source"
+                    elif access_mer == 200:
+                        content += "develop's change be merged to " + i
+
+                    if len(content) > 0:
+                        send_mail(to_list, mer_subject, content)
 
                 return json.dumps(response)
+
+        if payload['object_kind'] == "note":
+            print json.dumps(payload)
 
         # common for events
         # if payload['object_kind'] in ['push', 'issue']:
